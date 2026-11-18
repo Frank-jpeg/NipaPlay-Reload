@@ -1,0 +1,117 @@
+name: Build My APK
+
+# 自用构建：复用上游的依赖安装与构建 action，只把签名换成当场生成的自签名证书。
+# 上游 build-android.yml 是 workflow_call 类型且强制要 4 个 secrets，fork 里没有，
+# 直接跑必然卡在 apksigner。这里用 keytool 现造一个，装到平板上完全够用。
+on:
+  workflow_dispatch:
+    inputs:
+      note:
+        description: '备注（随便填，方便在运行列表里认出来）'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  android:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    env:
+      FVP_DEPS_URL: https://github.com/wang-bin/mdk-sdk/releases/latest/download/
+      FVP_DEPS_LATEST: 1
+      ERIKA_PREBUILT: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Free workspace disk
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== before ==="
+          df -h
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/lib/android/sdk/system-images || true
+          sudo rm -rf /usr/local/lib/android/sdk/emulator || true
+          sudo rm -rf /usr/local/lib/android/sdk/ndk/* || true
+          echo "=== after ==="
+          df -h
+
+      - name: Cache Gradle dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches/modules-2
+            ~/.gradle/caches/jars-*
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-v2-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', 'pubspec.lock') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-v2-
+
+      - name: Setup Flutter Environment
+        id: setup
+        uses: ./.github/actions/setup-flutter
+        with:
+          java-version: '17'
+
+      - name: Generate build info json
+        shell: bash
+        run: python3 .github/workflows/scripts/generate-build-info-json.py assets/build_info.json
+
+      - name: Make self-signed keystore
+        id: ks
+        shell: bash
+        run: |
+          set -euo pipefail
+          keytool -genkeypair -v \
+            -keystore selfbuild.jks \
+            -alias selfbuild \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass selfbuild123 -keypass selfbuild123 \
+            -dname "CN=NipaPlay SelfBuild, OU=Self, O=Self, L=NA, ST=NA, C=CN"
+          # 单行 base64，避免 composite action 里 echo 出换行问题
+          echo "key=$(base64 -w0 selfbuild.jks)" >> "$GITHUB_OUTPUT"
+          rm -f selfbuild.jks
+          echo "keystore 已生成"
+
+      - name: Build and sign Android
+        uses: ./.github/actions/build-android
+        with:
+          app-version: ${{ steps.setup.outputs.version }}
+          signing-key: ${{ steps.ks.outputs.key }}
+          keystore-password: selfbuild123
+          key-alias: selfbuild
+          key-password: selfbuild123
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: my-apk
+          path: build/app/outputs/apk/release/NipaPlay-*.apk
+          retention-days: 14
+          if-no-files-found: error
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "## 构建完成"
+            echo ""
+            echo "| 文件 | 大小 |"
+            echo "|---|---|"
+            for f in build/app/outputs/apk/release/NipaPlay-*.apk; do
+              [ -f "$f" ] && echo "| $(basename "$f") | $(du -h "$f" | cut -f1) |"
+            done
+            echo ""
+            echo "版本：${{ steps.setup.outputs.version }}"
+          } >> "$GITHUB_STEP_SUMMARY"
